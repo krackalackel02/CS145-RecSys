@@ -29,16 +29,21 @@ plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_style('whitegrid')
 plt.rcParams['figure.figsize'] = (14, 8)
 
-
-# Fix for KeyError: 'HOME' on Windows
-if 'HOME' not in os.environ:
-    os.environ['HOME'] = os.path.expanduser("~")
-if 'HADOOP_HOME' not in os.environ:
-    #need to be c://hadoop on Windows
-    os.environ['HADOOP_HOME'] = "C:\\hadoop"
+if os.name == 'nt':
+    # Fix for KeyError: 'HOME' on Windows
+    if 'HOME' not in os.environ:
+        os.environ['HOME'] = os.path.expanduser("~")
+    if 'HADOOP_HOME' not in os.environ:
+        #need to be c://hadoop on Windows
+        os.environ['HADOOP_HOME'] = "C:\\hadoop"
 # Set both driver and worker to use the current Python executable (should be 3.11)
 os.environ["PYSPARK_PYTHON"] = sys.executable
 os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+import getpass # To automatically get the current user's name
+
+# Set the HADOOP_USER_NAME environment variable
+# This must be done BEFORE the SparkSession is created
+os.environ['HADOOP_USER_NAME'] = getpass.getuser()
 
 # %% [markdown]
 # ## Initialize Spark session
