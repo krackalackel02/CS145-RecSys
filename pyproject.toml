@@ -5,6 +5,7 @@ description = "Simulator for recommendation algorithms"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "flask>=3.1.1",
     "jupyterlab>=4.4.0",
     "numpy<2",
     "pandas>=2.0.0",
@@ -14,5 +15,6 @@ dependencies = [
     "seaborn>=0.13.2",
     "torch>=2.0.0,<2.3.0",
     "torch-geometric>=2.6.1",
+    "werkzeug>=3.1.3",
     "xgboost>=3.0.2",
 ]
