@@ -3,291 +3,311 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
-from typing import Optional, Dict, List
+from torch_geometric.nn import GCNConv
+from torch_geometric.data import Data
+from torch_geometric.utils import negative_sampling
+from typing import Optional
 
-# Make sure you have PySpark and scikit-learn installed
+# Make sure you have PySpark installed and configured
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as sf
-from sklearn.preprocessing import StandardScaler
 
+# --- 0. Base Recommender Class ---
 # This assumes you have a local file `sample_recommenders.py` with BaseRecommender
 from sample_recommenders import BaseRecommender
 
-# --- Modules and Dataset classes are unchanged ---
+# This dictionary holds the best parameters found from your hyperparameter tuning script.
+# It's used to set the default values for the recommender.
+current_params = {'embedding_size': 64, 'num_layers': 2, 'epochs': 50, 'learning_rate': 0.001, 'weight_decay': 9e-05, 'dropout': 0.1}
 
-class TowerModel(nn.Module):
+# --- 2. GCN Model (Internal PyTorch Module) ---
+class GCNModel(nn.Module):
     """
-    A generic tower for either users or items. It processes numerical and categorical
-    features to produce a single output embedding.
+    A Graph Convolutional Network (GCN) model designed for recommendation.
+    This model learns embeddings for users and items by passing messages along the user-item interaction graph.
+    It's inspired by LightGCN, focusing on simple convolutions without extra transformations.
     """
-    def __init__(self, numerical_dim: int, categorical_vocabs: Dict[str, int], embedding_dim: int, output_dim: int):
+    def __init__(self, num_nodes: int, embedding_size: int, num_layers: int, dropout: float):
         super().__init__()
-        # Embedding layers for each categorical feature
-        self.cat_embeddings = nn.ModuleList([
-            nn.Embedding(num_embeddings, embedding_dim) for num_embeddings in categorical_vocabs.values()
-        ])
-        
-        # MLP to process the concatenated features
-        total_input_dim = numerical_dim + len(categorical_vocabs) * embedding_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(total_input_dim, total_input_dim * 2),
-            nn.ReLU(),
-            nn.Linear(total_input_dim * 2, output_dim)
-        )
+        # --- Layers ---
+        # The embedding layer stores a unique vector for each user and item.
+        # `max_norm=1.0` is a regularization technique that keeps the embedding vectors from growing too large.
+        self.embedding = nn.Embedding(num_nodes, embedding_size, max_norm=1.0)
 
-    def forward(self, numerical_feats: torch.Tensor, categorical_feats: torch.Tensor):
-        cat_embeds = [
-            embedding(categorical_feats[:, i]) for i, embedding in enumerate(self.cat_embeddings)
-        ]
-        cat_embeds_tensor = torch.cat(cat_embeds, dim=1) if cat_embeds else torch.empty(numerical_feats.shape[0], 0)
-        
-        all_feats = torch.cat([numerical_feats, cat_embeds_tensor], dim=1)
-        return self.mlp(all_feats)
+        # A list of GCN layers. Each layer performs one round of message passing.
+        self.convs = nn.ModuleList([GCNConv(embedding_size, embedding_size) for _ in range(num_layers)])
 
-class TwoTowerModel(nn.Module):
-    """The main recommender model, containing a tower for users and a tower for items."""
-    def __init__(self, user_tower: TowerModel, item_tower: TowerModel):
-        super().__init__()
-        self.user_tower = user_tower
-        self.item_tower = item_tower
+        # Dropout is a regularization technique to prevent overfitting by randomly setting some activations to zero.
+        self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, user_feats, item_feats):
-        user_embedding = self.user_tower(user_feats[0], user_feats[1])
-        item_embedding = self.item_tower(item_feats[0], item_feats[1])
-        return (user_embedding * item_embedding).sum(dim=1)
+        # --- Initialization ---
+        self.init_weights()
 
-class RecSysDataset(Dataset):
-    """PyTorch Dataset for loading interaction triplets (user, pos_item, neg_item)."""
-    def __init__(self, log_pd, all_item_ids):
-        self.users = log_pd['user_idx'].values
-        self.pos_items = log_pd['item_idx'].values
-        self.all_item_ids = all_item_ids
-        self.user_item_set = set(zip(self.users, self.pos_items))
+    def init_weights(self):
+        """Initialize embedding weights with Xavier uniform distribution for better training stability."""
+        nn.init.xavier_uniform_(self.embedding.weight)
 
-    def __len__(self):
-        return len(self.users)
+    def forward(self, edge_index: torch.Tensor) -> torch.Tensor:
+        """
+        The forward pass of the model, which computes the final node embeddings.
+        This is where the "learning" from the graph structure happens.
+        """
+        # Start with the initial, randomly initialized embeddings.
+        x = self.embedding.weight
+        # Propagate information through the GCN layers.
+        for conv in self.convs:
+            # Pass messages along the edges defined in edge_index.
+            x = conv(x, edge_index)
+            # Apply a non-linear activation function (ReLU).
+            x = torch.relu(x)
+            # Apply dropout for regularization.
+            x = self.dropout(x)
+        return x
 
-    def __getitem__(self, idx):
-        user_id = self.users[idx]
-        pos_item_id = self.pos_items[idx]
-        neg_item_id = np.random.choice(self.all_item_ids)
-        while (user_id, neg_item_id) in self.user_item_set:
-            neg_item_id = np.random.choice(self.all_item_ids)
-        return user_id, pos_item_id, neg_item_id
+    @staticmethod
+    def decode(z: torch.Tensor, edge_label_index: torch.Tensor) -> torch.Tensor:
+        """
+        Computes relevance scores for user-item pairs using a dot product.
+        A higher dot product between a user and item embedding means they are more similar.
+        """
+        # Get the final embeddings for the source (users) and destination (items) nodes.
+        src, dst = z[edge_label_index[0]], z[edge_label_index[1]]
+        # Calculate the dot product to get a single score per pair.
+        return (src * dst).sum(dim=-1)
 
-# --- Recommender Class with Price Weighting ---
-
+# --- 3. GraphCN Recommender Implementation ---
 class MyRecommender(BaseRecommender):
     """
-    A Two-Tower Recommender that automatically detects feature types and learns from them.
-    Includes an option for price-weighting in the final ranking.
+    A graph-based recommender that uses a GCN model to learn from user-item interactions.
+    It is trained with Bayesian Personalized Ranking (BPR) loss, which is specifically designed
+    for optimizing the ranking of items.
+
+    This recommender is designed to handle "cold-start" scenarios by building its vocabulary
+    from all known users and items, not just those with interactions.
     """
-    def __init__(self, seed: Optional[int] = None, epochs: int = 500, learning_rate: float = 0.001,
-                 embedding_dim: int = 64, output_dim: int = 64, 
-                 cardinality_threshold: int = 50,
-                 price_weighting: bool = True): # NEW parameter
+    def __init__(self, seed: Optional[int] = None,
+                 embedding_size: int = current_params['embedding_size'],
+                 num_layers: int = current_params['num_layers'],
+                 epochs: int = current_params['epochs'],
+                 learning_rate: float = current_params['learning_rate'],
+                 weight_decay: float = current_params['weight_decay'],
+                 dropout: float = current_params['dropout'],
+                 price_weighting: bool = True):
+        """
+        Initializes the recommender with a set of hyperparameters.
+
+        Args:
+            seed (Optional[int]): Random seed for reproducibility.
+            embedding_size (int): The dimensionality of the user and item vectors.
+            num_layers (int): The number of GCN layers (hops of message passing).
+            epochs (int): The number of full passes over the training data.
+            learning_rate (float): The step size for the optimizer.
+            weight_decay (float): The strength of L2 regularization to prevent overfitting.
+            dropout (float): The probability of an element to be zeroed out during training.
+            price_weighting (bool): If True, relevance score is `model_score * price`.
+        """
         super().__init__(seed)
+        self.embedding_size = embedding_size
+        self.num_layers = num_layers
         self.epochs = epochs
         self.lr = learning_rate
-        self.embedding_dim = embedding_dim
-        self.output_dim = output_dim
-        self.cardinality_threshold = cardinality_threshold
-        self.price_weighting = price_weighting # NEW attribute
+        self.weight_decay = weight_decay
+        self.dropout = dropout
+        self.price_weighting = price_weighting
 
-        self.user_numerical_cols: List[str] = []
-        self.user_categorical_cols: List[str] = []
-        self.item_numerical_cols: List[str] = []
-        self.item_categorical_cols: List[str] = []
-        
-        self.model: Optional[TwoTowerModel] = None
-        self.spark: Optional[SparkSession] = None
-        self.user_features_pd: Optional[pd.DataFrame] = None
+        # These members are initialized during the `fit` and `predict` calls.
+        self.model: Optional[GCNModel] = None
+        self.data: Optional[Data] = None
+        self.user_mapping: dict[int, int] = {}
+        self.item_mapping: dict[int, int] = {}
         self.item_features_pd: Optional[pd.DataFrame] = None
-        
-        self.user_scaler = StandardScaler()
-        self.item_scaler = StandardScaler()
-        self.user_cat_vocabs: Dict[str, Dict[int, int]] = {}
-        self.item_cat_vocabs: Dict[str, Dict[int, int]] = {}
+        self.spark: Optional[SparkSession] = None
 
-    def _discover_feature_types(self, df: pd.DataFrame, id_col: str):
-        numerical_cols = []
-        categorical_cols = []
-        for col in df.columns:
-            if col == id_col:
-                continue
-            if pd.api.types.is_float_dtype(df[col]):
-                numerical_cols.append(col)
-            elif pd.api.types.is_object_dtype(df[col]):
-                categorical_cols.append(col)
-            elif pd.api.types.is_integer_dtype(df[col]):
-                if df[col].nunique() < self.cardinality_threshold:
-                    categorical_cols.append(col)
-                else:
-                    numerical_cols.append(col)
-        return numerical_cols, categorical_cols
+    def fit(self, log: DataFrame, user_features: Optional[DataFrame] = None, item_features: Optional[DataFrame] = None):
+        """
+        Trains the GCN model on the provided interaction log.
+        """
+        if item_features is None:
+            raise ValueError("`item_features` (with 'item_idx') must be provided.")
 
-    def _preprocess_features(self, features_pd: pd.DataFrame, numerical_cols: List[str], categorical_cols: List[str], is_training: bool):
-        num_feats = features_pd[numerical_cols].values.astype(np.float32) if numerical_cols else np.empty((len(features_pd), 0), dtype=np.float32)
-        cat_feats = features_pd[categorical_cols].values if categorical_cols else np.empty((len(features_pd), 0), dtype=np.int64)
-        is_user_features = 'user_idx' in features_pd.index.name
-        
-        if numerical_cols:
-            scaler = self.user_scaler if is_user_features else self.item_scaler
-            if is_training:
-                num_feats = scaler.fit_transform(num_feats)
-            else:
-                num_feats = scaler.transform(num_feats)
-        
-        if categorical_cols:
-            mapped_cat_feats = np.zeros_like(cat_feats, dtype=np.int64)
-            vocabs = self.user_cat_vocabs if is_user_features else self.item_cat_vocabs
-            for i, col in enumerate(categorical_cols):
-                current_col_values = cat_feats[:, i]
-                if is_training:
-                    unique_vals = np.unique(current_col_values)
-                    vocabs[col] = {val: j for j, val in enumerate(unique_vals)}
-                mapper = np.vectorize(lambda x: vocabs[col].get(x, 0))
-                mapped_cat_feats[:, i] = mapper(current_col_values)
-            cat_feats = mapped_cat_feats
-        return torch.tensor(num_feats), torch.tensor(cat_feats, dtype=torch.long)
-
-    def fit(self, log: DataFrame, user_features: DataFrame, item_features: DataFrame):
-        print("\n--- [TwoTower] Starting fit() method ---")
+        print("\n--- [GraphCN] Starting fit() method ---")
+        # Store the spark session to be used later in predict()
         self.spark = log.sparkSession
-        
+        # Convert Spark DataFrames to pandas for local processing with PyTorch
         log_pd = log.select("user_idx", "item_idx").toPandas()
-        self.user_features_pd = user_features.toPandas().set_index('user_idx')
-        self.item_features_pd = item_features.toPandas().set_index('item_idx')
-        self.user_features_pd.index.name = 'user_idx'
-        self.item_features_pd.index.name = 'item_idx'
+        self.item_features_pd = item_features.toPandas()
 
-        self.user_numerical_cols, self.user_categorical_cols = self._discover_feature_types(self.user_features_pd.reset_index(), 'user_idx')
-        self.item_numerical_cols, self.item_categorical_cols = self._discover_feature_types(self.item_features_pd.reset_index(), 'item_idx')
+        # --- Vocabulary Construction ---
+        # Build the graph vocabulary from ALL known users and items. This is crucial
+        # to ensure the model can make predictions for items that haven't been seen yet.
+        if user_features is not None:
+            all_users = np.union1d(log_pd["user_idx"].unique(),
+                                   user_features.select("user_idx").toPandas()["user_idx"].unique())
+        else:
+            all_users = log_pd["user_idx"].unique()
+        all_items = self.item_features_pd["item_idx"].unique()
 
-        print("--- [TwoTower] Discovered User Features ---")
-        print(f"Numerical: {self.user_numerical_cols}")
-        print(f"Categorical: {self.user_categorical_cols}")
-        print("--- [TwoTower] Discovered Item Features ---")
-        print(f"Numerical: {self.item_numerical_cols}")
-        print(f"Categorical: {self.item_categorical_cols}")
+        # Build the graph data structure
+        self._build_graph(log_pd, all_users, all_items)
 
-        print("--- [TwoTower] Preprocessing features... ---")
-        self.user_num_T, self.user_cat_T = self._preprocess_features(self.user_features_pd, self.user_numerical_cols, self.user_categorical_cols, is_training=True)
-        self.item_num_T, self.item_cat_T = self._preprocess_features(self.item_features_pd, self.item_numerical_cols, self.item_categorical_cols, is_training=True)
+        # --- Model and Optimizer Setup ---
+        self.model = GCNModel(self.data.num_nodes, self.embedding_size, self.num_layers, self.dropout)
+        optimizer = optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
-        user_cat_vocab_sizes = {col: len(v) for col, v in self.user_cat_vocabs.items()}
-        item_cat_vocab_sizes = {col: len(v) for col, v in self.item_cat_vocabs.items()}
+        # --- Training Loop ---
+        print(f"--- [GraphCN] Starting training for {self.epochs} epochs ---")
+        self.model.train() # Set the model to training mode
+        train_edges = self.data.train_edge_index
+        num_pos_samples = train_edges.size(1)
 
-        user_tower = TowerModel(len(self.user_numerical_cols), user_cat_vocab_sizes, self.embedding_dim, self.output_dim)
-        item_tower = TowerModel(len(self.item_numerical_cols), item_cat_vocab_sizes, self.embedding_dim, self.output_dim)
-        self.model = TwoTowerModel(user_tower, item_tower)
-        optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-
-        dataset = RecSysDataset(log_pd, self.item_features_pd.index.values)
-        dataloader = DataLoader(dataset, batch_size=256, shuffle=True)
-        
-        user_id_map = {id: i for i, id in enumerate(self.user_features_pd.index)}
-        item_id_map = {id: i for i, id in enumerate(self.item_features_pd.index)}
-
-        print(f"--- [TwoTower] Starting training for {self.epochs} epochs ---")
-        self.model.train()
         for epoch in range(self.epochs):
-            total_loss = 0
-            for user_ids, pos_item_ids, neg_item_ids in dataloader:
-                optimizer.zero_grad()
-                user_indices = torch.tensor([user_id_map[uid.item()] for uid in user_ids], dtype=torch.long)
-                pos_item_indices = torch.tensor([item_id_map[iid.item()] for iid in pos_item_ids], dtype=torch.long)
-                neg_item_indices = torch.tensor([item_id_map[iid.item()] for iid in neg_item_ids], dtype=torch.long)
+            # 1. Forward pass: Get the latest node embeddings
+            z = self.model(self.data.edge_index)
 
-                user_emb = self.model.user_tower(self.user_num_T[user_indices], self.user_cat_T[user_indices])
-                pos_item_emb = self.model.item_tower(self.item_num_T[pos_item_indices], self.item_cat_T[pos_item_indices])
-                neg_item_emb = self.model.item_tower(self.item_num_T[neg_item_indices], self.item_cat_T[neg_item_indices])
-                
-                pos_scores = (user_emb * pos_item_emb).sum(dim=1)
-                neg_scores = (user_emb * neg_item_emb).sum(dim=1)
-                loss = -F.logsigmoid(pos_scores - neg_scores).mean()
-                
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
+            # 2. Negative Sampling: For each positive interaction, sample a negative one.
+            # This is done in a bipartite-aware way to ensure we only sample user-item pairs.
+            try:
+                # Use the modern PyG API if available (>=2.4)
+                neg_edge_index = negative_sampling(
+                    edge_index=self.data.edge_index,
+                    num_nodes=self.data.num_nodes,
+                    num_neg_samples=num_pos_samples,
+                    method='bipartite',
+                )
+            except (TypeError, AssertionError):
+                # Fallback for older PyG versions. This loop ensures we get enough valid samples.
+                neg_edges = []
+                collected_neg_edges = 0
+                while collected_neg_edges < num_pos_samples:
+                    raw_neg_batch = negative_sampling(edge_index=self.data.edge_index, num_nodes=self.data.num_nodes, num_neg_samples=num_pos_samples)
+                    mask = (raw_neg_batch[0] < self.data.num_users) & (raw_neg_batch[1] >= self.data.num_users)
+                    valid_neg_batch = raw_neg_batch[:, mask]
+                    neg_edges.append(valid_neg_batch)
+                    collected_neg_edges += valid_neg_batch.size(1)
+                neg_edge_index = torch.cat(neg_edges, dim=1)[:, :num_pos_samples]
 
-            print(f"--- [TwoTower] Epoch {epoch+1}/{self.epochs}, BPR Loss: {total_loss/len(dataloader):.4f} ---")
-        
-        print("--- [TwoTower] Training complete ---")
+            # 3. Score calculation
+            pos_scores = GCNModel.decode(z, train_edges)
+            neg_scores = GCNModel.decode(z, neg_edge_index)
+
+            # 4. BPR Loss Calculation: The goal is to make positive scores higher than negative scores.
+            loss = -torch.nn.functional.logsigmoid(pos_scores - neg_scores).mean()
+
+            # 5. Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), 1.0) # Gradient clipping for stability
+            optimizer.step()
+
+            if (epoch + 1) % 10 == 0:
+                print(f"--- [GraphCN] Epoch {epoch+1}/{self.epochs}, BPR Loss: {loss.item():.4f} ---")
+
+        print("--- [GraphCN] Training complete ---")
         return self
 
-    # MODIFIED predict method
+    def _build_graph(self, log_pd: pd.DataFrame, all_users: np.ndarray, all_items: np.ndarray):
+        """Helper method to construct the PyTorch Geometric graph data structure."""
+        print("--- [GraphCN] Building graph... ---")
+        # Create mappings from original user/item IDs to new, continuous integer indices (0, 1, 2, ...).
+        self.user_mapping = {int(u): i for i, u in enumerate(sorted(all_users))}
+        self.item_mapping = {int(it): i for i, it in enumerate(sorted(all_items))}
+
+        # Apply these mappings to the interaction log.
+        log_pd["user_map_idx"] = log_pd["user_idx"].map(self.user_mapping)
+        log_pd["item_map_idx"] = log_pd["item_idx"].map(self.item_mapping)
+        log_pd.dropna(subset=['user_map_idx', 'item_map_idx'], inplace=True)
+
+        # Create the edge index tensor for the graph. Item indices are offset by the number of users.
+        num_users = len(self.user_mapping)
+        user_idx_tensor = torch.tensor(log_pd["user_map_idx"].values, dtype=torch.long)
+        item_idx_tensor = torch.tensor(log_pd["item_map_idx"].values, dtype=torch.long) + num_users
+
+        # Create edges in both directions (user->item and item->user) for message passing.
+        edge_ui = torch.stack([user_idx_tensor, item_idx_tensor])
+        edge_iu = torch.stack([item_idx_tensor, user_idx_tensor])
+        edge_index = torch.cat([edge_ui, edge_iu], dim=1)
+
+        # Store everything in a PyG Data object.
+        self.data = Data(edge_index=edge_index)
+        self.data.num_users = num_users
+        self.data.num_items = len(self.item_mapping)
+        self.data.num_nodes = self.data.num_users + self.data.num_items
+        self.data.train_edge_index = edge_ui # Store user->item edges for BPR training
+        print("--- [GraphCN] Graph construction complete ---")
+
+
     def predict(self, log: DataFrame, k: int, users: DataFrame, items: DataFrame,
-                user_features: DataFrame, item_features: DataFrame, filter_seen_items: bool = True) -> DataFrame:
-        if self.model is None:
+                user_features: Optional[DataFrame] = None, item_features: Optional[DataFrame] = None,
+                filter_seen_items: bool = True) -> DataFrame:
+        """
+        Generates top-K recommendations for the given users.
+        """
+        if self.model is None or self.spark is None:
             raise RuntimeError("Call fit() before predict().")
 
-        print("\n--- [TwoTower] Starting predict() method ---")
-        self.model.eval()
+        print("\n--- [GraphCN] Starting predict() method ---")
+        self.model.eval() # Set the model to evaluation mode
 
+        # --- Candidate Generation ---
+        # Create all possible user-item pairs to score.
         users_pd = users.select("user_idx").toPandas()
         items_pd = items.select("item_idx").toPandas()
-        
-        pred_user_features = self.user_features_pd.loc[users_pd['user_idx'].unique()]
-        pred_item_features = self.item_features_pd.loc[items_pd['item_idx'].unique()]
-        pred_user_features.index.name = 'user_idx'
-        pred_item_features.index.name = 'item_idx'
+        all_pairs = users_pd.assign(key=1).merge(items_pd.assign(key=1), on="key").drop("key", axis=1)
 
-        with torch.no_grad():
-            user_num_T, user_cat_T = self._preprocess_features(pred_user_features, self.user_numerical_cols, self.user_categorical_cols, is_training=False)
-            item_num_T, item_cat_T = self._preprocess_features(pred_item_features, self.item_numerical_cols, self.item_categorical_cols, is_training=False)
-            
-            user_embeddings = self.model.user_tower(user_num_T, user_cat_T)
-            item_embeddings = self.model.item_tower(item_num_T, item_cat_T)
-
-            all_scores = torch.matmul(user_embeddings, item_embeddings.T)
-
-        # --- MODIFIED: Ranking logic with optional price weighting ---
-        recs = []
-        user_ids = pred_user_features.index.values
-        item_ids = pred_item_features.index.values
-
-        # Create a price lookup dictionary if weighting is enabled
-        price_lookup = None
-        if self.price_weighting:
-            print("--- [TwoTower] Applying price weighting to scores ---")
-            if 'price' in self.item_features_pd.columns:
-                price_lookup = self.item_features_pd['price'].to_dict()
-            else:
-                print("Warning: 'price' column not found. Cannot apply price weighting.")
-
+        # --- Filtering ---
+        # Remove items that users have already interacted with.
         if filter_seen_items:
-            seen_items_by_user = log.select("user_idx", "item_idx").toPandas().groupby('user_idx')['item_idx'].apply(set).to_dict()
+            seen_pd = log.select("user_idx", "item_idx").toPandas()
+            all_pairs = all_pairs.merge(seen_pd, on=["user_idx", "item_idx"], how="left", indicator=True)
+            all_pairs = all_pairs[all_pairs["_merge"] == "left_only"].drop("_merge", axis=1)
 
-        for i, user_id in enumerate(user_ids):
-            model_scores = all_scores[i].cpu().numpy()
-            
-            # Combine model scores with price to get final relevance
-            if price_lookup:
-                # Multiply score by price, using 1.0 as default if price is missing
-                relevance_scores = [model_scores[j] * price_lookup.get(item_id, 1.0) for j, item_id in enumerate(item_ids)]
-            else:
-                relevance_scores = model_scores
-                
-            item_relevance = list(zip(item_ids, relevance_scores))
-            
-            if filter_seen_items:
-                seen_items = seen_items_by_user.get(user_id, set())
-                item_relevance = [pair for pair in item_relevance if pair[0] not in seen_items]
-            
-            item_relevance.sort(key=lambda x: x[1], reverse=True)
-            for item_id, relevance in item_relevance[:k]:
-                recs.append({'user_idx': user_id, 'item_idx': item_id, 'relevance': float(relevance)})
-        
-        final_recs_pd = pd.DataFrame(recs)
-        
-        if final_recs_pd.empty:
-            return self.spark.createDataFrame(final_recs_pd, schema="user_idx long, item_idx long, relevance double")
+        # Map original IDs to the model's internal integer indices.
+        all_pairs["user_map_idx"] = all_pairs["user_idx"].map(self.user_mapping)
+        all_pairs["item_map_idx"] = all_pairs["item_idx"].map(self.item_mapping)
+        all_pairs.dropna(subset=["user_map_idx", "item_map_idx"], inplace=True)
+        # Ensure mapped indices are integers before passing to torch
+        all_pairs = all_pairs.astype({"user_map_idx": int, "item_map_idx": int})
 
+        # --- Scoring ---
+        # Prepare the data for PyTorch.
+        num_users = self.data.num_users
+        src = torch.tensor(all_pairs["user_map_idx"].values, dtype=torch.long)
+        dst = torch.tensor(all_pairs["item_map_idx"].values, dtype=torch.long) + num_users
+        pred_edge_index = torch.stack([src, dst])
+
+        # Get scores from the model.
+        with torch.no_grad():
+            z = self.model(self.data.edge_index)
+            scores = GCNModel.decode(z, pred_edge_index)
+        all_pairs["score"] = scores.cpu().numpy()
+
+        # --- Ranking ---
+        # Calculate final relevance, potentially weighting by price.
+        if self.price_weighting:
+            # Create a price lookup map from the item features
+            price_lookup = self.item_features_pd.set_index("item_idx")["price"]
+            all_pairs["price"] = all_pairs["item_idx"].map(price_lookup)
+            # Ensure price is float and fill NaNs for calculation
+            all_pairs["relevance"] = all_pairs["score"] * all_pairs["price"].fillna(1.0).astype(float)
+        else:
+            all_pairs["relevance"] = all_pairs["score"]
+
+        # Get the top K recommendations for each user.
+        all_pairs.sort_values(["user_idx", "relevance"], ascending=[True, False], inplace=True)
+        top_k = all_pairs.groupby("user_idx").head(k)
+        # Select final columns and ensure user/item IDs are 64-bit integers in pandas
+        final_recs_pd = top_k[['user_idx', 'item_idx', 'relevance']].astype({
+            'user_idx': np.int64,
+            'item_idx': np.int64
+        })
+
+        # --- Formatting for Submission ---
+        # Convert the pandas DataFrame back to a Spark DataFrame.
         recs_spark = self.spark.createDataFrame(final_recs_pd)
+        # Ensure the output schema has the correct data types.
+        # np.int64 in pandas correctly maps to LongType in Spark.
+        # We explicitly cast relevance to DoubleType for safety.
         recs_spark = recs_spark.withColumn("relevance", sf.col("relevance").cast("double"))
 
-        print("--- [TwoTower] Prediction complete ---")
+        print("--- [GraphCN] Prediction complete, returning results ---")
         return recs_spark
