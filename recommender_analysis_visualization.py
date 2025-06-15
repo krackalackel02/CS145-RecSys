@@ -1000,6 +1000,7 @@ from recommenders.checkpoint1.logistic_regression import LogRegModel
 from recommenders.checkpoint2.sequential_reccomenders import RNNRecommender,LSTMRecommender,TransformerRecommender
 from recommenders.checkpoint3.graphCN import GraphCNRecommender
 from recommenders.checkpoint3.LightGCN import LightGCNRecommender
+from recommenders.checkpoint3.tower import TwoTowerRecommender
 # Initialize the recommenders we want to compare
 recommenders = [
     # RandomRecommender(seed=config['data_generation']['seed']),
@@ -1008,12 +1009,13 @@ recommenders = [
     # LinearRegressionRecommender(seed=config['data_generation']['seed']),
     # GradientBoostRecommender(seed=config['data_generation']['seed']),
     GraphCNRecommender(seed=config['data_generation']['seed']),
-    LightGCNRecommender(seed=config['data_generation']['seed']),
+    # LightGCNRecommender(seed=config['data_generation']['seed']),
     # KNNRecommender( seed=config['data_generation']['seed']),
     # RNNRecommender(seed=config['data_generation']['seed']),
     # LSTMRecommender(seed=config['data_generation']['seed']),
     # TransformerRecommender(seed=config['data_generation']['seed']),
-    # LogRegModel(seed=config['data_generation']['seed'])
+    # LogRegModel(seed=config['data_generation']['seed']),
+    TwoTowerRecommender(seed=config['data_generation']['seed']),
 ]
 recommender_names = [
     # "Random",
@@ -1022,12 +1024,13 @@ recommender_names = [
     # "LinearRegression",
     # "GradientBoost",
     "GraphCN",
-    "LightGCN",
+    # "LightGCN",
     # "KNN",
     # "RNN",
     # "LSTM",
     # "Transformer",
-    # "LogisticRegression"
+    # "LogisticRegression",
+    "TwoTower"
     ]
 # Fit each recommender on the initial history
 for recommender in recommenders:

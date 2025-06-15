@@ -79,7 +79,7 @@ class RecSysDataset(Dataset):
 
 # --- Recommender Class with Price Weighting ---
 
-class MyRecommender(BaseRecommender):
+class TwoTowerRecommender(BaseRecommender):
     """
     A Two-Tower Recommender that automatically detects feature types and learns from them.
     Includes an option for price-weighting in the final ranking.

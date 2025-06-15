@@ -18,7 +18,7 @@ from sample_recommenders import BaseRecommender
 
 # This dictionary holds the best parameters found from your hyperparameter tuning script.
 # It's used to set the default values for the recommender.
-current_params = {'embedding_size': 64, 'num_layers': 2, 'epochs': 50, 'learning_rate': 0.001, 'weight_decay': 9e-05, 'dropout': 0.1}
+current_params = {'embedding_size': 64, 'num_layers': 2, 'epochs': 500, 'learning_rate': 0.001, 'weight_decay': 9e-05, 'dropout': 0.1}
 
 # --- 2. GCN Model (Internal PyTorch Module) ---
 class GCNModel(nn.Module):
