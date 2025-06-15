@@ -1001,6 +1001,8 @@ from recommenders.checkpoint2.sequential_reccomenders import RNNRecommender,LSTM
 from recommenders.checkpoint3.graphCN import GraphCNRecommender
 from recommenders.checkpoint3.LightGCN import LightGCNRecommender
 from recommenders.checkpoint3.tower import TwoTowerRecommender
+from recommenders.checkpoint3.lstm import MyLSTMRecommender
+from recommenders.hybrid import HybridRecommender
 # Initialize the recommenders we want to compare
 recommenders = [
     # RandomRecommender(seed=config['data_generation']['seed']),
@@ -1008,14 +1010,16 @@ recommenders = [
     # ContentBasedRecommender(similarity_threshold=0.0, seed=config['data_generation']['seed']),
     # LinearRegressionRecommender(seed=config['data_generation']['seed']),
     # GradientBoostRecommender(seed=config['data_generation']['seed']),
-    GraphCNRecommender(seed=config['data_generation']['seed']),
+    # GraphCNRecommender(seed=config['data_generation']['seed']),
     # LightGCNRecommender(seed=config['data_generation']['seed']),
     # KNNRecommender( seed=config['data_generation']['seed']),
     # RNNRecommender(seed=config['data_generation']['seed']),
     # LSTMRecommender(seed=config['data_generation']['seed']),
     # TransformerRecommender(seed=config['data_generation']['seed']),
     # LogRegModel(seed=config['data_generation']['seed']),
-    TwoTowerRecommender(seed=config['data_generation']['seed']),
+    # TwoTowerRecommender(seed=config['data_generation']['seed']),
+    # MyLSTMRecommender(seed=config['data_generation']['seed']),
+    HybridRecommender(seed=config['data_generation']['seed']),
 ]
 recommender_names = [
     # "Random",
@@ -1023,14 +1027,16 @@ recommender_names = [
     # "ContentBased",
     # "LinearRegression",
     # "GradientBoost",
-    "GraphCN",
+    # "GraphCN",
     # "LightGCN",
     # "KNN",
     # "RNN",
     # "LSTM",
     # "Transformer",
     # "LogisticRegression",
-    "TwoTower"
+    # "TwoTower",
+    # "MyLSTM",
+    "Hybrid"
     ]
 # Fit each recommender on the initial history
 for recommender in recommenders:
