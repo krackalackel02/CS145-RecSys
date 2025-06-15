@@ -1005,24 +1005,24 @@ from recommenders.checkpoint3.lstm import MyLSTMRecommender
 from recommenders.hybrid import HybridRecommender
 # Initialize the recommenders we want to compare
 recommenders = [
-    # RandomRecommender(seed=config['data_generation']['seed']),
+    RandomRecommender(seed=config['data_generation']['seed']),
     # PopularityRecommender(alpha=1.0, seed=config['data_generation']['seed']),
     # ContentBasedRecommender(similarity_threshold=0.0, seed=config['data_generation']['seed']),
     # LinearRegressionRecommender(seed=config['data_generation']['seed']),
-    # GradientBoostRecommender(seed=config['data_generation']['seed']),
+    GradientBoostRecommender(seed=config['data_generation']['seed']),
     # GraphCNRecommender(seed=config['data_generation']['seed']),
     # LightGCNRecommender(seed=config['data_generation']['seed']),
-    # KNNRecommender( seed=config['data_generation']['seed']),
+    KNNRecommender( seed=config['data_generation']['seed']),
     # RNNRecommender(seed=config['data_generation']['seed']),
     # LSTMRecommender(seed=config['data_generation']['seed']),
     # TransformerRecommender(seed=config['data_generation']['seed']),
-    # LogRegModel(seed=config['data_generation']['seed']),
+    LogRegModel(seed=config['data_generation']['seed']),
     # TwoTowerRecommender(seed=config['data_generation']['seed']),
     # MyLSTMRecommender(seed=config['data_generation']['seed']),
-    HybridRecommender(seed=config['data_generation']['seed']),
+    # HybridRecommender(seed=config['data_generation']['seed']),
 ]
 recommender_names = [
-    # "Random",
+    "Random",
     # "Popularity",
     # "ContentBased",
     # "LinearRegression",
@@ -1036,7 +1036,7 @@ recommender_names = [
     # "LogisticRegression",
     # "TwoTower",
     # "MyLSTM",
-    "Hybrid"
+    # "Hybrid"
     ]
 # Fit each recommender on the initial history
 for recommender in recommenders:
